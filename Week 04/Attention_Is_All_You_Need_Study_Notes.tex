@@ -448,6 +448,61 @@ After deriving every gradient, one simultaneous update of all parameter matrices
 \]
 This decrease is a useful consistency check for the entire backward pass.
 
+\subsection{Training the complete toy model}
+
+We then placed the entire forward pass, backward pass, and simultaneous parameter update inside a
+1,000-step full-batch gradient-descent loop. All five parameter arrays---$E$, $W_Q$, $W_K$, $W_V$, and
+$W_{\rm vocab}$---were updated with learning rate $\eta=0.1$. The measured losses were:
+
+\begin{center}
+\begin{tabular}{rr@{\qquad}rr}
+\toprule
+Step & Loss & Step & Loss\\
+\midrule
+0   & 1.769590 & 500 & 0.013696\\
+100 & 0.513505 & 600 & 0.008181\\
+200 & 0.200898 & 700 & 0.005599\\
+300 & 0.100495 & 800 & 0.004159\\
+400 & 0.029505 & 900 & 0.003261\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The final recorded loss at step 999 was $0.002661$. Thus the complete manually differentiated model,
+rather than only its vocabulary projection, learned to assign nearly all probability to the four training
+targets.
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[x=0.72cm,y=1.35cm]
+  \draw[-{Latex[length=2mm]}] (0,0) -- (10.5,0) node[right] {training step};
+  \draw[-{Latex[length=2mm]}] (0,0) -- (0,1.95) node[above] {loss};
+  \foreach \x/\lab in {0/0,2/200,4/400,6/600,8/800,10/1000}
+    \draw (\x,0.03)--(\x,-0.03) node[below] {\lab};
+  \foreach \y/\lab in {0.5/0.5,1/1.0,1.5/1.5}
+    \draw (0.04,\y)--(-0.04,\y) node[left] {\lab};
+  \draw[codeblue,very thick]
+    plot[smooth] coordinates {
+      (0,1.769590) (1,0.513505) (2,0.200898) (3,0.100495)
+      (4,0.029505) (5,0.013696) (6,0.008181) (7,0.005599)
+      (8,0.004159) (9,0.003261) (9.99,0.002661)
+    };
+  \foreach \x/\y in {
+    0/1.769590,1/0.513505,2/0.200898,3/0.100495,4/0.029505,
+    5/0.013696,6/0.008181,7/0.005599,8/0.004159,9/0.003261,9.99/0.002661}
+    \fill[codeblue] (\x,\y) circle (1.3pt);
+\end{tikzpicture}
+\caption{Measured 100-step checkpoints of mean next-token cross-entropy while all toy-model parameters are trained. The repository also contains the full-resolution exported curve.}
+\label{fig:learningcurve}
+\end{figure}
+
+The full-resolution history contained 104 individual steps at which the loss increased, even though every
+100-step checkpoint decreased. This is compatible with gradient descent: $-\grad L$ is a downhill direction
+for an infinitesimal displacement, while the finite update $-\eta\grad L$ can overshoot a locally favorable
+distance. The model is also nonconvex and all parameter matrices change together. Reducing $\eta$ usually
+makes the trajectory smoother at the cost of slower progress. These temporary increases should not be
+confused with predictive entropy; the plotted quantity is cross-entropy against the observed targets.
+
 The toy keys happened to be identical. Because each row of $\grad_S L$ sums to zero,
 \[
   \grad_Q L=\frac{\grad_S L\,K}{\sqrt{d_k}}\approx0
