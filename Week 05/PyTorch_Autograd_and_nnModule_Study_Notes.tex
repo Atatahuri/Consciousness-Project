@@ -395,6 +395,125 @@ A notebook stores code and displayed outputs, but a restarted kernel loses Pytho
 \item move mature reusable functions into a Python module when the notebook becomes long.
 \end{enumerate}
 
+\section{Learning from random initialization}
+
+The first toy model began with matrices whose entries were chosen by hand. That is useful for checking every
+calculation, but a trainable model should not depend on already favorable weights. We therefore repeated the
+same experiment with randomly initialized parameters and verified that gradient descent still reduced the
+cross-entropy loss.
+
+\subsection{Architecture sizes are hyperparameters}
+
+The integers
+\[
+  V=\texttt{vocab\_size},\qquad d_{\rm model},\qquad d_k,\qquad d_v
+\]
+describe the architecture. They are selected deliberately rather than sampled randomly. They determine the
+parameter shapes:
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+Parameter & Shape & Role\\
+\midrule
+$E$ & $(V,d_{\rm model})$ & token embedding table\\
+$W_Q$ & $(d_{\rm model},d_k)$ & query projection\\
+$W_K$ & $(d_{\rm model},d_k)$ & key projection\\
+$W_V$ & $(d_{\rm model},d_v)$ & value projection\\
+$W_{\rm vocab}$ & $(d_v,V)$ & hidden state to vocabulary logits\\
+\bottomrule
+\end{tabular}
+\end{center}
+For the experiment, $(V,d_{\rm model},d_k,d_v)=(4,4,2,3)$. The resulting logit matrix has shape $(4,4)$:
+four supervised positions and four possible next-token classes.
+
+\subsection{Reproducible pseudorandom numbers}
+
+The command
+\begin{lstlisting}
+torch.manual_seed(0)
+\end{lstlisting}
+sets the initial state of PyTorch's pseudorandom-number generator. The values are still varied, but rerunning
+the program with the same seed generates the same sequence. This makes an experiment reproducible. Changing
+the seed changes the initial weights and may change the precise learning curve.
+
+\subsection{Why scale random weights?}
+
+A matrix product forms each output coordinate by adding $d_{\rm in}$ terms. If all weights have unit variance,
+the variance of this sum can grow roughly in proportion to $d_{\rm in}$. Large activations can make optimization
+unstable or push nonlinearities into saturated regimes. A simple initialization is therefore
+\[
+  W_{ij}\sim\frac{\mathcal N(0,1)}{\sqrt{d_{\rm in}}}.
+\]
+The factor $1/\sqrt{d_{\rm in}}$ keeps the initial output scale roughly independent of the input dimension.
+In our model this gives
+\begin{align*}
+ E&=\frac{\operatorname{randn}(V,d_{\rm model})}{\sqrt{d_{\rm model}}},\\
+ W_Q,W_K,W_V&=\frac{\operatorname{randn}(\cdot,\cdot)}{\sqrt{d_{\rm model}}},\\
+ W_{\rm vocab}&=\frac{\operatorname{randn}(d_v,V)}{\sqrt{d_v}}.
+\end{align*}
+This initialization scaling is conceptually separate from the attention-score scaling
+$QK^\top/\sqrt{d_k}$. The former controls the scale of newly created parameters; the latter controls dot-product
+scores during every forward pass.
+
+\subsection{What \texttt{nn.Parameter} means}
+
+An \texttt{nn.Parameter} is a tensor that an enclosing \texttt{nn.Module} registers as trainable. For example,
+\begin{lstlisting}
+self.W_Q = nn.Parameter(
+    torch.randn(d_model, d_k) / (d_model ** 0.5)
+)
+\end{lstlisting}
+has three consequences:
+\begin{enumerate}
+  \item it behaves like a tensor in expressions such as \texttt{X @ self.W\_Q};
+  \item it tracks derivatives, so backpropagation stores $\partial L/\partial W_Q$ in
+  \texttt{self.W\_Q.grad};
+  \item it appears in \texttt{model.parameters()} and \texttt{model.named\_parameters()}, so an optimizer can
+  discover and update it.
+\end{enumerate}
+A regular tensor assigned to the module is not automatically a trainable registered parameter. Also, the
+scaling must occur inside the constructor:
+\begin{lstlisting}
+# Correct: the object assigned to self.W_Q is a Parameter.
+self.W_Q = nn.Parameter(torch.randn(d_model, d_k) / d_model**0.5)
+\end{lstlisting}
+
+\subsection{Randomly initialized module}
+
+The essential initialization is:
+\begin{lstlisting}
+class ToyAttentionModel(nn.Module):
+    def __init__(self, vocab_size, d_model, d_k, d_v):
+        super().__init__()
+
+        self.E = nn.Parameter(
+            torch.randn(vocab_size, d_model) / d_model**0.5
+        )
+        self.W_Q = nn.Parameter(
+            torch.randn(d_model, d_k) / d_model**0.5
+        )
+        self.W_K = nn.Parameter(
+            torch.randn(d_model, d_k) / d_model**0.5
+        )
+        self.W_V = nn.Parameter(
+            torch.randn(d_model, d_v) / d_model**0.5
+        )
+        self.W_vocab = nn.Parameter(
+            torch.randn(d_v, vocab_size) / d_v**0.5
+        )
+\end{lstlisting}
+The forward computation remains unchanged: embedding lookup, query/key/value projections, scaled causal
+attention, value aggregation, and vocabulary logits. Cross-entropy and optimization remain outside
+\texttt{forward}.
+
+\subsection{What the experiment establishes}
+
+The loss decreased smoothly from a random starting point, and every registered parameter had its intended
+shape. This shows that the forward graph, automatic differentiation, and optimizer are connected correctly,
+and that learning does not depend on the earlier hand-selected matrices. Because the training data is still
+one tiny sequence, a very small training loss demonstrates successful optimization and memorization rather
+than general language ability. Generalization must be evaluated on held-out sequences.
+
 \section{Review questions}
 
 Answer these without running code:
@@ -411,17 +530,21 @@ Answer these without running code:
 \item Why should cross-entropy and target IDs usually remain outside \texttt{forward}?
 \item Why does \texttt{model.parameters()} simplify optimizer construction?
 \item What is the difference between a zero gradient and \texttt{None}?
+\item Which dimensions are architecture choices, and which quantities are randomly initialized?
+\item What does \texttt{torch.manual\_seed(0)} guarantee, and what does it not guarantee?
+\item Why divide a random matrix by the square root of its input dimension?
+\item Why must scaling occur inside \texttt{nn.Parameter(...)}?
 \end{enumerate}
 
 \section{Next steps}
 
-The next session should begin by reconstructing the class slowly from a blank cell. Once the roles of
-\texttt{\_\_init\_\_}, \texttt{self}, \texttt{nn.Parameter}, and \texttt{forward} are comfortable, we can:
+The next session should begin by reconstructing the randomly initialized class from a blank cell. Then we can:
 \begin{enumerate}
-\item train the module and plot its loss;
-\item replace hand-selected matrices with reproducible random initialization;
+\item compare several seeds and learning rates without changing the model equations;
 \item compare selected autograd derivatives with centered finite differences;
-\item add positional encoding and test sensitivity to word order.
+\item replace manual parameter matrices with \texttt{nn.Embedding} and \texttt{nn.Linear};
+\item add positional encoding and test sensitivity to word order;
+\item train on multiple sequences and measure held-out loss.
 \end{enumerate}
 
 \end{document}
