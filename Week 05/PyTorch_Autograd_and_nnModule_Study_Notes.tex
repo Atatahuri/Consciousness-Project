@@ -120,7 +120,7 @@ appropriate for the CPU even though large neural networks benefit strongly from 
 
 Consider
 \[
-L=(x-5)^2,qquad x=3.
+L=(x-5)^2,\qquad x=3.
 \]
 Creating $x$ with \texttt{requires\_grad=True} tells PyTorch to record operations involving $x$:
 \begin{lstlisting}
@@ -514,6 +514,205 @@ and that learning does not depend on the earlier hand-selected matrices. Because
 one tiny sequence, a very small training loss demonstrates successful optimization and memorization rather
 than general language ability. Generalization must be evaluated on held-out sequences.
 
+\section{Python classes, objects, methods, and \texttt{self}}
+
+The second implementation replaced manually stored parameter matrices with standard PyTorch layers. Before
+using those layers, it is useful to distinguish an ordinary function from a method stored in a class.
+
+\subsection{Ordinary function calls}
+
+An ordinary function definition such as
+\begin{lstlisting}
+def f(x, y):
+    return x + y
+\end{lstlisting}
+creates a callable object named \texttt{f}. Parentheses execute it:
+\begin{lstlisting}
+answer = f(2, 3)
+\end{lstlisting}
+The variables \texttt{x} and \texttt{y} are local inputs that exist during the call. Attributes use a dot,
+but function arguments are not accessed as \texttt{f.x}. The expression \texttt{f.x} would instead ask whether
+the function object itself has a stored attribute named \texttt{x}.
+
+\subsection{Classes and instances}
+
+A class is a recipe for constructing objects that store state and behavior:
+\begin{lstlisting}
+class ToyModel:
+    def __init__(self, size):
+        self.size = size
+\end{lstlisting}
+The call
+\begin{lstlisting}
+model = ToyModel(4)
+\end{lstlisting}
+causes Python to create a new object, pass that object into \texttt{\_\_init\_\_} as \texttt{self}, pass
+\texttt{4} as \texttt{size}, and execute \texttt{self.size = size}. After construction,
+\texttt{model.size} is \texttt{4}.
+
+The name \texttt{self} is not a special function. It is the conventional name for the particular object on
+which a method is operating. Python supplies it automatically. If two instances are constructed,
+\begin{lstlisting}
+model1 = ToyModel(4)
+model2 = ToyModel(9)
+\end{lstlisting}
+then \texttt{model1.size} and \texttt{model2.size} belong to different objects. During a call through
+\texttt{model1}, \texttt{self} refers to \texttt{model1}; during a call through \texttt{model2}, it refers to
+\texttt{model2}. The object to the left of the dot determines which stored attribute Python retrieves.
+
+\subsection{What \texttt{\_\_init\_\_} and \texttt{super()} do}
+
+The method \texttt{\_\_init\_\_} initializes a newly created instance. Persistent components must be attached
+to the instance with \texttt{self.}; an unqualified local variable disappears when initialization finishes.
+For a subclass of \texttt{nn.Module},
+\begin{lstlisting}
+super().__init__()
+\end{lstlisting}
+calls the parent \texttt{nn.Module} initializer. This prepares PyTorch's machinery for registering parameters,
+submodules, and buffers, moving a model between devices, and saving or loading model state.
+
+The distinction between \texttt{nn} and \texttt{self} is therefore:
+\begin{itemize}
+  \item \texttt{nn} is the imported \texttt{torch.nn} namespace---a toolbox containing classes such as
+  \texttt{Module}, \texttt{Embedding}, and \texttt{Linear};
+  \item \texttt{self} is the particular model instance currently being initialized or used.
+\end{itemize}
+For example, \texttt{nn.Embedding(...)} constructs a layer, while
+\texttt{self.embedding = nn.Embedding(...)} installs that layer in the current model.
+
+\section{From text to shifted training pairs}
+
+For the sentence
+\begin{center}
+\texttt{Attention is all you need !}
+\end{center}
+we used a small token-to-ID dictionary. Python's basic \texttt{split()} separates on whitespace, so punctuation
+must be separated by spaces in this toy tokenizer. A production tokenizer handles punctuation, subwords,
+unknown pieces, and many other cases explicitly.
+
+If the complete ID sequence is
+\[
+(t_0,t_1,t_2,t_3,t_4,t_5),
+\]
+next-token training forms
+\[
+\text{input IDs}=(t_0,t_1,t_2,t_3,t_4),\qquad
+\text{target IDs}=(t_1,t_2,t_3,t_4,t_5).
+\]
+In Python this is simply:
+\begin{lstlisting}
+input_ids = token_ids[:-1]
+target_ids = token_ids[1:]
+\end{lstlisting}
+Both become \texttt{torch.long} tensors because embedding lookup and cross-entropy targets are integer class
+indices, not differentiable continuous quantities.
+
+Sequence length and vocabulary size are different. If the input contains $T$ positions and the vocabulary
+contains $C$ token types, then $T$ can change from sentence to sentence while $C$ determines the fixed number
+of embedding rows and output classes. In the current example, $T=5$ and $C=7$.
+
+\section{Standard PyTorch layers for the attention model}
+
+The new model uses
+\begin{lstlisting}
+self.embedding = nn.Embedding(vocab_size, d_model)
+self.query = nn.Linear(d_model, d_k, bias=False)
+self.key = nn.Linear(d_model, d_k, bias=False)
+self.value = nn.Linear(d_model, d_v, bias=False)
+self.output = nn.Linear(d_v, vocab_size, bias=False)
+\end{lstlisting}
+An \texttt{nn.Embedding(C, d)} stores a trainable matrix with shape $(C,d)$. Calling
+\texttt{self.embedding(input\_ids)} selects the rows named by the integer IDs. Repeated IDs select the same
+row, and their gradient contributions accumulate into that shared row.
+
+An \texttt{nn.Linear(d\_in, d\_out, bias=False)} represents a linear transformation from
+$\R^{d_{\rm in}}$ to $\R^{d_{\rm out}}$. PyTorch stores its weight with shape
+$(d_{\rm out},d_{\rm in})$ and evaluates
+\[
+  \operatorname{Linear}(X)=XW^\top.
+\]
+This transposed storage convention differs from the earlier notation $XW_Q$, where we wrote $W_Q$ with shape
+$(d_{\rm model},d_k)$, but the mathematical transformation is the same.
+
+With $T=5$, $C=7$, $d_{\rm model}=7$, $d_k=4$, and $d_v=5$, the forward shapes are:
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+Quantity & Shape & Construction\\
+\midrule
+$X$ & $(5,7)$ & embedding lookup\\
+$Q$ & $(5,4)$ & query layer\\
+$K$ & $(5,4)$ & key layer\\
+$V_{\rm values}$ & $(5,5)$ & value layer\\
+$S$ & $(5,5)$ & $QK^\top/\sqrt{d_k}$\\
+$M$ & $(5,5)$ & causal mask\\
+$A$ & $(5,5)$ & row-wise softmax of $S+M$\\
+$O$ & $(5,5)$ & $AV_{\rm values}$\\
+$Z$ & $(5,7)$ & output vocabulary layer\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Mask dtype and device}
+
+The causal mask was created with
+\begin{lstlisting}
+M = torch.full(
+    (T, T),
+    float("-inf"),
+    dtype=X.dtype,
+    device=X.device
+)
+M = torch.triu(M, diagonal=1)
+\end{lstlisting}
+The option \texttt{dtype=X.dtype} gives the mask the same numerical type as $X$, such as
+\texttt{torch.float32}. This avoids unintended type conversion when adding $M$ to $S$.
+
+The option \texttt{device=X.device} places the mask on the same processor as $X$, such as the CPU, a CUDA GPU,
+or an Apple MPS device. Tensors in one arithmetic operation normally must live on the same device. Deriving both
+properties from $X$ makes the forward method continue to work after the whole model and its inputs are moved.
+
+After \texttt{torch.triu(..., diagonal=1)}, the mask is zero on and below the diagonal and $-\infty$ above it.
+Consequently, row $i$ can attend only to source positions $j\le i$. Row-wise softmax produces a Gibbs
+distribution over those permitted sources, and every row of $A$ sums to one.
+
+\section{Closed-notes checkpoint for the next session}
+
+Before adding optimization, reconstruct the ideas below without opening the notebook. Write dimensions beside
+every line. The checkpoint should be treated as diagnosis rather than a performance judgment: any uncertain
+answer determines what to review before training.
+
+\subsection*{Part A: explain in words}
+\begin{enumerate}
+  \item What is the difference between a class and an instance?
+  \item What object does \texttt{self} refer to, and how does Python choose it?
+  \item What happens when \texttt{ToyAttentionModel(...)} is called?
+  \item Why is \texttt{super().\_\_init\_\_()} required for an \texttt{nn.Module} subclass?
+  \item Which quantities belong in \texttt{\_\_init\_\_}, and which belong in \texttt{forward}?
+  \item Why are input and target IDs stored as \texttt{torch.long}?
+  \item Explain the difference among sequence length, vocabulary size, and the attention value matrix.
+  \item What do \texttt{dtype=X.dtype} and \texttt{device=X.device} guarantee?
+\end{enumerate}
+
+\subsection*{Part B: reconstruct the model}
+\begin{enumerate}
+  \item Create the vocabulary and convert the sentence to IDs without hard-coding the final ID list.
+  \item Produce shifted input and target tensors using slicing.
+  \item Define the module constructor with \texttt{vocab\_size}, \texttt{d\_model}, \texttt{d\_k}, and
+  \texttt{d\_v}.
+  \item Create one embedding and four bias-free linear layers with correct dimensions.
+  \item Implement embedding lookup, $Q,K,V$, scaled scores, the causal mask, row-wise softmax, $O$, and logits.
+  \item Predict every shape before running the cell, then verify the attention row sums.
+\end{enumerate}
+
+\subsection*{Part C: optimization preview}
+\begin{enumerate}
+  \item Why should \texttt{forward} return raw logits rather than vocabulary probabilities?
+  \item What shapes must logits and target IDs have for cross-entropy?
+  \item Put \texttt{optimizer.zero\_grad()}, \texttt{loss.backward()}, and \texttt{optimizer.step()} in order and
+  explain the job of each.
+\end{enumerate}
+
 \section{Review questions}
 
 Answer these without running code:
@@ -538,11 +737,12 @@ Answer these without running code:
 
 \section{Next steps}
 
-The next session should begin by reconstructing the randomly initialized class from a blank cell. Then we can:
+The next session should begin with the closed-notes checkpoint above. Once the model can be reconstructed and
+explained, we can:
 \begin{enumerate}
+\item train the \texttt{nn.Embedding}/\texttt{nn.Linear} model with cross-entropy and SGD;
+\item inspect predictions before and after optimization and plot the loss;
 \item compare several seeds and learning rates without changing the model equations;
-\item compare selected autograd derivatives with centered finite differences;
-\item replace manual parameter matrices with \texttt{nn.Embedding} and \texttt{nn.Linear};
 \item add positional encoding and test sensitivity to word order;
 \item train on multiple sequences and measure held-out loss.
 \end{enumerate}
