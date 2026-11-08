@@ -1,0 +1,441 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=0.85in]{geometry}
+\usepackage{amsmath,amssymb,bm}
+\usepackage{booktabs,array}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{listings}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning}
+
+\definecolor{navy}{RGB}{35,66,112}
+\definecolor{green}{RGB}{35,112,70}
+\definecolor{codeback}{RGB}{247,248,251}
+\definecolor{softblue}{RGB}{232,239,250}
+\definecolor{softred}{RGB}{252,235,235}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=navy,
+  urlcolor=navy
+}
+
+\lstset{
+  language=Python,
+  basicstyle=\ttfamily\small,
+  keywordstyle=\color{navy}\bfseries,
+  commentstyle=\color{green},
+  backgroundcolor=\color{codeback},
+  frame=single,
+  breaklines=true,
+  showstringspaces=false,
+  columns=fullflexible,
+  keepspaces=true
+}
+
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\softmax}{\operatorname{softmax}}
+\newcommand{\argmax}{\operatorname*{arg\,max}}
+
+\title{From Memorization to Held-Out Validation\\
+\large Multi-Sentence Training with a Causal PyTorch Attention Model}
+\author{Week 05 Study Notes --- Consciousness Project}
+\date{November 2026}
+
+\begin{document}
+\maketitle
+
+\begin{center}
+\fcolorbox{navy}{softblue}{
+\begin{minipage}{0.89\textwidth}
+\textbf{Central lesson.} A very small training loss proves that an optimizer fit the training examples.
+It does not by itself prove that the model learned a rule that works on unseen sequences. Training loss and
+held-out validation loss answer different questions.
+\end{minipage}}
+\end{center}
+
+\tableofcontents
+\newpage
+
+\section{Purpose of the experiment}
+
+The earlier model repeatedly trained on one sentence until it predicted every next token correctly. That
+experiment verified the complete computational pipeline:
+\[
+\text{text}\to\text{IDs}\to\text{attention}\to\text{logits}
+\to\text{cross-entropy}\to\text{backpropagation}\to\text{SGD}.
+\]
+However, one sentence cannot distinguish learning from memorization. The next experiment therefore uses
+several training sequences and one held-out sequence.
+
+The training corpus is
+\begin{align*}
+&\texttt{I love math !}\\
+&\texttt{You love attention !}\\
+&\texttt{We love math !}
+\end{align*}
+and the held-out sequence is
+\[
+\texttt{We love attention !}.
+\]
+All validation tokens occur somewhere in training, but the complete validation sequence is not used for any
+parameter update.
+
+\section{Vocabulary and shifted next-token supervision}
+
+The shared vocabulary assigns one consecutive integer to every token:
+\begin{center}
+\begin{tabular}{cccccccc}
+\toprule
+Token & \texttt{I} & \texttt{love} & \texttt{math} & \texttt{We} & \texttt{You} & \texttt{!} & \texttt{attention}\\
+\midrule
+ID & 0 & 1 & 2 & 3 & 4 & 5 & 6\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+For a token-ID sequence
+\[
+(t_0,t_1,\ldots,t_m),
+\]
+autoregressive next-token training uses
+\[
+\bm{x}=(t_0,t_1,\ldots,t_{m-1}),\qquad
+\bm{y}=(t_1,t_2,\ldots,t_m).
+\]
+Thus the sentence \texttt{I love math !} becomes
+\[
+\bm{x}=(0,1,2),\qquad \bm{y}=(1,2,5).
+\]
+Each input position is paired with the token immediately following it.
+
+\begin{lstlisting}
+training_sentences = [
+    "I love math !",
+    "You love attention !",
+    "We love math !",
+]
+validation_sentence = "We love attention !"
+
+vocabulary = {
+    "I": 0, "love": 1, "math": 2, "We": 3,
+    "You": 4, "!": 5, "attention": 6,
+}
+
+def encode_sentence(sentence, vocabulary):
+    token_ids = []
+    for token in sentence.split():
+        token_ids.append(vocabulary[token])
+
+    input_ids = torch.tensor(token_ids[:-1], dtype=torch.long)
+    target_ids = torch.tensor(token_ids[1:], dtype=torch.long)
+    return input_ids, target_ids
+\end{lstlisting}
+
+\subsection{Why the encoder handles one sentence}
+
+The encoding function processes exactly one sequence. The training loop is responsible for calling it once
+per training sentence. Concatenating all sentences inside the encoder would create false transitions such as
+\[
+\texttt{!}\longrightarrow\texttt{You}
+\]
+between unrelated examples. Keeping these responsibilities separate also makes the function reusable for
+validation and future datasets.
+
+\section{Causal attention model}
+
+Let $C$ be vocabulary size, $T$ sequence length, $d_{\rm model}$ embedding width, $d_k$ query/key width,
+and $d_v$ value width. The trainable layers implement
+\begin{align}
+X &= E[\bm{x}] \in \R^{T\times d_{\rm model}},\\
+Q &= XW_Q,\qquad K=XW_K,\qquad V=XW_V,\\
+S &= \frac{QK^\top}{\sqrt{d_k}}+M,\\
+A &= \softmax_{\rm row}(S),\\
+O &= AV,\\
+Z &= OW_{\rm vocab}.
+\end{align}
+
+Here $Z\in\R^{T\times C}$ contains raw vocabulary logits. Row $i$ scores every possible token as the next
+token after the prefix available at position $i$.
+
+\subsection{Causal mask}
+
+The mask is
+\[
+M_{ij}=\begin{cases}
+0,&j\le i,\\
+-\infty,&j>i.
+\end{cases}
+\]
+Because $e^{-\infty}=0$, position $i$ assigns zero attention probability to future source positions. The
+row-wise softmax creates a Gibbs distribution over only the permitted sources:
+\[
+A_{ij}=\frac{e^{S_{ij}}}{\sum_{r=1}^{T}e^{S_{ir}}},
+\qquad \sum_j A_{ij}=1.
+\]
+
+\subsection{PyTorch implementation}
+
+\begin{lstlisting}
+class ToyAttentionModel(nn.Module):
+    def __init__(self, vocab_size, d_model, d_k, d_v):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, d_model)
+        self.query = nn.Linear(d_model, d_k, bias=False)
+        self.key = nn.Linear(d_model, d_k, bias=False)
+        self.value = nn.Linear(d_model, d_v, bias=False)
+        self.output = nn.Linear(d_v, vocab_size, bias=False)
+
+    def forward(self, input_ids):
+        X = self.embedding(input_ids)
+        Q = self.query(X)
+        K = self.key(X)
+        V_values = self.value(X)
+
+        d_k = Q.shape[1]
+        scores = (Q @ K.T) / (d_k ** 0.5)
+
+        T = input_ids.shape[0]
+        mask = torch.full(
+            (T, T),
+            float("-inf"),
+            dtype=X.dtype,
+            device=X.device,
+        )
+        mask = torch.triu(mask, diagonal=1)
+
+        attention = torch.softmax(scores + mask, dim=1)
+        O = attention @ V_values
+        logits = self.output(O)
+        return logits
+\end{lstlisting}
+
+\subsection{Python and PyTorch details}
+
+\begin{itemize}
+\item \texttt{self} is the particular model instance on which a method operates. Calling
+\texttt{model(input\_ids)} invokes \texttt{model.forward(input\_ids)} with \texttt{self=model}.
+\item Components stored as \texttt{self.embedding}, \texttt{self.query}, and so on persist in the model and are
+registered by \texttt{nn.Module}. Temporary tensors such as $X,Q,K,V,S,A,O,Z$ are recalculated in every forward
+pass.
+\item \texttt{dtype=X.dtype} makes the mask use the same numerical type as $X$, preventing unintended type
+conversion during $S+M$.
+\item \texttt{device=X.device} creates the mask on the same CPU, CUDA GPU, or Apple MPS device as $X$. Tensors
+participating in one operation must normally live on the same device.
+\item \texttt{nn.Linear(a,b,bias=False)} stores a weight of shape $(b,a)$ and evaluates $XW^\top$. This storage
+orientation differs from the earlier handwritten $XW$ notation, but the transformation is equivalent.
+\end{itemize}
+
+\section{Cross-entropy and sentence loss}
+
+For one sentence with $T$ supervised positions and correct target ID $y_i$ at position $i$, the loss is
+\begin{equation}
+L_s(\theta)=-\frac{1}{T}\sum_{i=1}^{T}\log
+\frac{\exp Z_{i,y_i}(\theta)}{\sum_{c=1}^{C}\exp Z_{i,c}(\theta)}.
+\end{equation}
+PyTorch evaluates this numerically stable expression with
+\begin{lstlisting}
+loss = F.cross_entropy(logits, targets)
+\end{lstlisting}
+using raw logits. Applying softmax before \texttt{F.cross\_entropy} would duplicate part of its calculation and
+reduce numerical stability.
+
+\section{Epochs and stochastic gradient descent}
+
+One \emph{epoch} means visiting every training sentence once. If there are three sentence losses
+$L_1,L_2,L_3$, the reported epoch loss is
+\[
+\overline{L}_{\rm train}=\frac{L_1+L_2+L_3}{3}.
+\]
+In this experiment the optimizer updates after each sentence, so it performs stochastic gradient descent:
+\[
+\theta\leftarrow\theta-\eta\nabla_\theta L_s(\theta).
+\]
+
+\begin{lstlisting}
+torch.manual_seed(0)
+model = ToyAttentionModel(
+    vocab_size=len(vocabulary),
+    d_model=len(vocabulary),
+    d_k=4,
+    d_v=5,
+)
+optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+training_loss_history = []
+
+for epoch in range(501):
+    total_training_loss = 0.0
+
+    for sentence in training_sentences:
+        inputs, targets = encode_sentence(sentence, vocabulary)
+
+        optimizer.zero_grad()
+        logits = model(inputs)
+        loss = F.cross_entropy(logits, targets)
+        loss.backward()
+        optimizer.step()
+
+        total_training_loss += loss.item()
+
+    average_training_loss = (
+        total_training_loss / len(training_sentences)
+    )
+    training_loss_history.append(average_training_loss)
+\end{lstlisting}
+
+The ordering matters:
+\begin{enumerate}
+\item \texttt{zero\_grad()} removes derivatives accumulated during the previous update;
+\item the forward pass computes predictions using the current parameters;
+\item \texttt{backward()} applies reverse-mode chain rules and fills parameter gradients;
+\item \texttt{step()} updates the parameters using those gradients.
+\end{enumerate}
+
+The total loss must be accumulated inside the sentence loop, while division and history recording occur after
+all sentences have been visited. Otherwise, one might accidentally report only the final sentence loss or a
+cumulative average containing every earlier epoch.
+
+\section{Held-out validation}
+
+Validation asks how the final parameters behave on data that supplied no gradient updates. It uses
+\texttt{model.eval()} and \texttt{torch.no\_grad()}:
+
+\begin{lstlisting}
+model.eval()
+validation_inputs, validation_targets = encode_sentence(
+    validation_sentence, vocabulary
+)
+
+with torch.no_grad():
+    validation_logits = model(validation_inputs)
+    validation_loss = F.cross_entropy(
+        validation_logits, validation_targets
+    )
+    predicted_ids = torch.argmax(validation_logits, dim=1)
+\end{lstlisting}
+
+\texttt{model.eval()} selects evaluation behavior for layers such as dropout and batch normalization. This toy
+model has neither, so its current numbers do not change, but the call is good general practice.
+\texttt{torch.no\_grad()} prevents creation of an unnecessary derivative graph. Validation contains no
+\texttt{backward()} and no optimizer step.
+
+The predicted token at row $i$ is
+\[
+\widehat y_i=\argmax_c Z_{i,c}.
+\]
+A reverse dictionary maps each predicted ID back to readable text.
+
+\section{Observed results}
+
+\begin{center}
+\begin{tabular}{lr}
+\toprule
+Measurement & Value\\
+\midrule
+Average training loss after epoch 500 & $0.000868$\\
+Held-out validation loss & $2.560667$\\
+Validation targets & \texttt{love, attention, !}\\
+Validation predictions & \texttt{love, math, !}\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The first and third predictions generalized correctly:
+\[
+\texttt{We}\longrightarrow\texttt{love},
+\qquad
+\texttt{We love attention}\longrightarrow\texttt{!}.
+\]
+The middle prediction did not:
+\[
+\texttt{We love}\longrightarrow\texttt{math}
+\quad\text{instead of}\quad\texttt{attention},
+\]
+
+\begin{center}
+\fcolorbox{navy}{softred}{
+\begin{minipage}{0.88\textwidth}
+\textbf{Interpretation.} The gap between $0.000868$ training loss and $2.560667$ validation loss is direct
+evidence that fitting the three training sentences did not produce reliable behavior on the held-out sequence.
+The optimizer succeeded at its training objective; the dataset and learned rule did not support the requested
+generalization.
+\end{minipage}}
+\end{center}
+
+\section{A subtle limitation of this validation split}
+
+The training set explicitly contains
+\[
+\texttt{We love}\longrightarrow\texttt{math},
+\]
+whereas validation asks the identical prefix to predict
+\[
+\texttt{We love}\longrightarrow\texttt{attention}.
+\]
+The empirical training distribution therefore gives
+\[
+\widehat P(\texttt{math}\mid\texttt{We love})=1,
+\qquad
+\widehat P(\texttt{attention}\mid\texttt{We love})=0.
+\]
+Driving training cross-entropy toward zero encourages exactly the prediction \texttt{math}. Thus this split is
+useful for exposing memorization and uncertainty, but it is not a clean test in which the held-out answer follows
+unambiguously from the training labels. Natural language often permits several valid continuations, while the
+tiny dataset presents each prefix as if it had only one correct continuation.
+
+A stronger future experiment should provide multiple examples supporting a reusable rule, avoid directly
+contradicting the held-out target for the same prefix, and evaluate several held-out sentences. For example, one
+could introduce more subjects and objects, reserve combinations whose prefixes were not seen exactly, and report
+average validation loss across the complete split.
+
+\section{What this experiment proves and does not prove}
+
+It establishes that:
+\begin{itemize}
+\item one model can receive variable sentence examples through a reusable encoder;
+\item PyTorch correctly accumulates gradients and updates shared embedding and projection weights;
+\item average epoch loss can be computed across several examples;
+\item validation can be measured without modifying parameters;
+\item very low training loss can coexist with very high held-out loss.
+\end{itemize}
+
+It does not establish that:
+\begin{itemize}
+\item the model understands the meanings of \texttt{math}, \texttt{attention}, or \texttt{love};
+\item the model generalizes to arbitrary English sentences;
+\item attention alone is sufficient for a practical language model;
+\item this one held-out example provides a statistically reliable estimate of performance.
+\end{itemize}
+
+\section{Review questions}
+
+Answer these without running the notebook:
+\begin{enumerate}
+\item Why must token IDs be consecutive integers smaller than vocabulary size?
+\item Why does the encoder process one sentence instead of looping over the whole dataset?
+\item What false training pairs appear if unrelated sentences are concatenated without a boundary token?
+\item What is the difference between a sentence loss and an epoch-average training loss?
+\item Why is the epoch loop outside the sentence loop?
+\item Why are gradient clearing, backpropagation, and optimizer stepping inside the sentence loop here?
+\item Why does validation use neither \texttt{backward()} nor \texttt{step()}?
+\item What do \texttt{eval()} and \texttt{no\_grad()} each do?
+\item Why are raw logits passed to cross-entropy?
+\item What does the observed train/validation loss gap demonstrate?
+\item Why is the chosen validation split partly contradictory?
+\item Design a better training/validation split that tests a reusable pattern.
+\end{enumerate}
+
+\section{Next milestones}
+
+The most useful progression is:
+\begin{enumerate}
+\item redesign the corpus to give non-contradictory held-out combinations;
+\item record both training and validation loss after every epoch and plot them together;
+\item add positional encodings and test whether word order changes predictions;
+\item introduce mini-batches and padding masks for unequal sequence lengths;
+\item compare SGD with Adam and separate learning-rate effects from data effects;
+\item train on a larger corpus and report averages across several validation examples.
+\end{enumerate}
+
+\end{document}
